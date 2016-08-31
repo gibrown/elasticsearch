@@ -328,10 +328,7 @@ public class InternalEngine extends Engine {
                         throw new VersionConflictEngineException(shardId, uid.type(), uid.id(),
                                 get.versionType().explainConflictForReads(versionValue.version(), get.version()));
                     }
-                    Translog.Operation op = translog.read(versionValue.translogLocation());
-                    if (op != null) {
-                        return new GetResult(true, versionValue.version(), op.getSource());
-                    }
+                    refresh("realtime_get");
                 }
             }
 
@@ -368,11 +365,11 @@ public class InternalEngine extends Engine {
         return currentVersion;
     }
 
-    private static VersionValueSupplier NEW_VERSION_VALUE = (u, t, l) -> new VersionValue(u, l);
+    private static VersionValueSupplier NEW_VERSION_VALUE = (u, t) -> new VersionValue(u);
 
     @FunctionalInterface
     private interface VersionValueSupplier {
-        VersionValue apply(long updatedVersion, long time, Translog.Location location);
+        VersionValue apply(long updatedVersion, long time);
     }
 
     private <T extends Engine.Operation> void maybeAddToTranslog(
@@ -383,27 +380,21 @@ public class InternalEngine extends Engine {
         if (op.origin() != Operation.Origin.LOCAL_TRANSLOG_RECOVERY) {
             final Translog.Location translogLocation = translog.add(toTranslogOp.apply(op));
             op.setTranslogLocation(translogLocation);
-            versionMap.putUnderLock(op.uid().bytes(), toVersionValue.apply(updatedVersion, engineConfig.getThreadPool().estimatedTimeInMillis(), op.getTranslogLocation()));
-        } else {
-            // we do not replay in to the translog, so there is no
-            // translog location; that is okay because real-time
-            // gets are not possible during recovery and we will
-            // flush when the recovery is complete
-            versionMap.putUnderLock(op.uid().bytes(), toVersionValue.apply(updatedVersion, engineConfig.getThreadPool().estimatedTimeInMillis(), null));
         }
+        versionMap.putUnderLock(op.uid().bytes(), toVersionValue.apply(updatedVersion, engineConfig.getThreadPool().estimatedTimeInMillis()));
+
     }
 
     @Override
-    public boolean index(Index index) {
-        final boolean created;
+    public void index(Index index) {
         try (ReleasableLock lock = readLock.acquire()) {
             ensureOpen();
             if (index.origin().isRecovery()) {
                 // Don't throttle recovery operations
-                created = innerIndex(index);
+                innerIndex(index);
             } else {
                 try (Releasable r = throttle.acquireThrottle()) {
-                    created = innerIndex(index);
+                    innerIndex(index);
                 }
             }
         } catch (IllegalStateException | IOException e) {
@@ -414,10 +405,9 @@ public class InternalEngine extends Engine {
             }
             throw new IndexFailedEngineException(shardId, index.type(), index.id(), e);
         }
-        return created;
     }
 
-    private boolean innerIndex(Index index) throws IOException {
+    private void innerIndex(Index index) throws IOException {
         try (Releasable ignored = acquireLock(index.uid())) {
             lastWriteNanos = index.startTime();
             final long currentVersion;
@@ -432,15 +422,16 @@ public class InternalEngine extends Engine {
             }
 
             final long expectedVersion = index.version();
-            if (checkVersionConflict(index, currentVersion, expectedVersion, deleted)) return false;
+            if (checkVersionConflict(index, currentVersion, expectedVersion, deleted)) {
+                index.setCreated(false);
+                return;
+            }
 
             final long updatedVersion = updateVersion(index, currentVersion, expectedVersion);
 
-            final boolean created = indexOrUpdate(index, currentVersion, versionValue);
+            indexOrUpdate(index, currentVersion, versionValue);
 
             maybeAddToTranslog(index, updatedVersion, Translog.Index::new, NEW_VERSION_VALUE);
-
-            return created;
         }
     }
 
@@ -450,16 +441,14 @@ public class InternalEngine extends Engine {
         return updatedVersion;
     }
 
-    private boolean indexOrUpdate(final Index index, final long currentVersion, final VersionValue versionValue) throws IOException {
-        final boolean created;
+    private void indexOrUpdate(final Index index, final long currentVersion, final VersionValue versionValue) throws IOException {
         if (currentVersion == Versions.NOT_FOUND) {
             // document does not exists, we can optimize for create
-            created = true;
+            index.setCreated(true);
             index(index, indexWriter);
         } else {
-            created = update(index, versionValue, indexWriter);
+            update(index, versionValue, indexWriter);
         }
-        return created;
     }
 
     private static void index(final Index index, final IndexWriter indexWriter) throws IOException {
@@ -470,19 +459,17 @@ public class InternalEngine extends Engine {
         }
     }
 
-    private static boolean update(final Index index, final VersionValue versionValue, final IndexWriter indexWriter) throws IOException {
-        final boolean created;
+    private static void update(final Index index, final VersionValue versionValue, final IndexWriter indexWriter) throws IOException {
         if (versionValue != null) {
-            created = versionValue.delete(); // we have a delete which is not GC'ed...
+            index.setCreated(versionValue.delete()); // we have a delete which is not GC'ed...
         } else {
-            created = false;
+            index.setCreated(false);
         }
         if (index.docs().size() > 1) {
             indexWriter.updateDocuments(index.uid(), index.docs());
         } else {
             indexWriter.updateDocument(index.uid(), index.docs().get(0));
         }
-        return created;
     }
 
     @Override
@@ -562,8 +549,8 @@ public class InternalEngine extends Engine {
             ensureOpen();
             searcherManager.maybeRefreshBlocking();
         } catch (AlreadyClosedException e) {
-            ensureOpen();
-            maybeFailEngine("refresh", e);
+            failOnTragicEvent(e);
+            throw e;
         } catch (EngineClosedException e) {
             throw e;
         } catch (Exception e) {
@@ -610,8 +597,8 @@ public class InternalEngine extends Engine {
                 indexWriter.flush();
             }
         } catch (AlreadyClosedException e) {
-            ensureOpen();
-            maybeFailEngine("writeIndexingBuffer", e);
+            failOnTragicEvent(e);
+            throw e;
         } catch (EngineClosedException e) {
             throw e;
         } catch (Exception e) {
@@ -835,6 +822,14 @@ public class InternalEngine extends Engine {
             } finally {
                 store.decRef();
             }
+        } catch (AlreadyClosedException ex) {
+            /* in this case we first check if the engine is still open. If so this exception is just fine
+             * and expected. We don't hold any locks while we block on forceMerge otherwise it would block
+             * closing the engine as well. If we are not closed we pass it on to failOnTragicEvent which ensures
+             * we are handling a tragic even exception here */
+            ensureOpen();
+            failOnTragicEvent(ex);
+            throw ex;
         } catch (Exception e) {
             try {
                 maybeFailEngine("force merge", e);
@@ -869,26 +864,35 @@ public class InternalEngine extends Engine {
         }
     }
 
+    private void failOnTragicEvent(AlreadyClosedException ex) {
+        // if we are already closed due to some tragic exception
+        // we need to fail the engine. it might have already been failed before
+        // but we are double-checking it's failed and closed
+        if (indexWriter.isOpen() == false && indexWriter.getTragicException() != null) {
+            final Exception tragedy = indexWriter.getTragicException() instanceof Exception ?
+                (Exception) indexWriter.getTragicException() :
+                new Exception(indexWriter.getTragicException());
+            failEngine("already closed by tragic event on the index writer", tragedy);
+        } else if (translog.isOpen() == false && translog.getTragicException() != null) {
+            failEngine("already closed by tragic event on the translog", translog.getTragicException());
+        } else {
+            // this smells like a bug - we only expect ACE if we are in a fatal case ie. either translog or IW is closed by
+            // a tragic event or has closed itself. if that is not the case we are in a buggy state and raise an assertion error
+            throw new AssertionError("Unexpected AlreadyClosedException", ex);
+        }
+    }
+
     @Override
     protected boolean maybeFailEngine(String source, Exception e) {
         boolean shouldFail = super.maybeFailEngine(source, e);
         if (shouldFail) {
             return true;
         }
-
-        // Check for AlreadyClosedException
+        // Check for AlreadyClosedException -- ACE is a very special
+        // exception that should only be thrown in a tragic event. we pass on the checks to failOnTragicEvent which will
+        // throw and AssertionError if the tragic event condition is not met.
         if (e instanceof AlreadyClosedException) {
-            // if we are already closed due to some tragic exception
-            // we need to fail the engine. it might have already been failed before
-            // but we are double-checking it's failed and closed
-            if (indexWriter.isOpen() == false && indexWriter.getTragicException() != null) {
-                final Exception tragedy = indexWriter.getTragicException() instanceof Exception ?
-                        (Exception) indexWriter.getTragicException() :
-                        new Exception(indexWriter.getTragicException());
-                failEngine("already closed by tragic event on the index writer", tragedy);
-            } else if (translog.isOpen() == false && translog.getTragicException() != null) {
-                failEngine("already closed by tragic event on the translog", translog.getTragicException());
-            }
+            failOnTragicEvent((AlreadyClosedException)e);
             return true;
         } else if (e != null &&
             ((indexWriter.isOpen() == false && indexWriter.getTragicException() == e)
@@ -914,6 +918,7 @@ public class InternalEngine extends Engine {
 
     @Override
     public long getIndexBufferRAMBytesUsed() {
+        // We don't guard w/ readLock here, so we could throw AlreadyClosedException
         return indexWriter.ramBytesUsed() + versionMap.ramBytesUsedForRefresh();
     }
 
@@ -963,8 +968,9 @@ public class InternalEngine extends Engine {
                 logger.trace("rollback indexWriter");
                 try {
                     indexWriter.rollback();
-                } catch (AlreadyClosedException e) {
-                    // ignore
+                } catch (AlreadyClosedException ex) {
+                    failOnTragicEvent(ex);
+                    throw ex;
                 }
                 logger.trace("rollback indexWriter done");
             } catch (Exception e) {

@@ -277,7 +277,7 @@ public abstract class Engine implements Closeable {
         }
     }
 
-    public abstract boolean index(Index operation) throws EngineException;
+    public abstract void index(Index operation) throws EngineException;
 
     public abstract void delete(Delete delete) throws EngineException;
 
@@ -591,7 +591,7 @@ public abstract class Engine implements Closeable {
               the store is closed so we need to make sure we increment it here
              */
             try {
-                return !getSearcherManager().isSearcherCurrent();
+                return getSearcherManager().isSearcherCurrent() == false;
             } catch (IOException e) {
                 logger.error("failed to access searcher manager", e);
                 failEngine("failed to access searcher manager", e);
@@ -847,6 +847,7 @@ public abstract class Engine implements Closeable {
     public static class Index extends Operation {
 
         private final ParsedDocument doc;
+        private boolean created;
 
         public Index(Term uid, ParsedDocument doc, long version, VersionType versionType, Origin origin, long startTime) {
             super(uid, version, versionType, origin, startTime);
@@ -903,6 +904,14 @@ public abstract class Engine implements Closeable {
 
         public BytesReference source() {
             return this.doc.source();
+        }
+
+        public boolean isCreated() {
+            return created;
+        }
+
+        public void setCreated(boolean created) {
+            this.created = created;
         }
 
         @Override
@@ -1000,32 +1009,23 @@ public abstract class Engine implements Closeable {
     public static class GetResult implements Releasable {
         private final boolean exists;
         private final long version;
-        private final Translog.Source source;
         private final Versions.DocIdAndVersion docIdAndVersion;
         private final Searcher searcher;
 
-        public static final GetResult NOT_EXISTS = new GetResult(false, Versions.NOT_FOUND, null);
+        public static final GetResult NOT_EXISTS = new GetResult(false, Versions.NOT_FOUND, null, null);
 
-        /**
-         * Build a realtime get result from the translog.
-         */
-        public GetResult(boolean exists, long version, @Nullable Translog.Source source) {
-            this.source = source;
+        private GetResult(boolean exists, long version, Versions.DocIdAndVersion docIdAndVersion, Searcher searcher) {
             this.exists = exists;
             this.version = version;
-            this.docIdAndVersion = null;
-            this.searcher = null;
+            this.docIdAndVersion = docIdAndVersion;
+            this.searcher = searcher;
         }
 
         /**
          * Build a non-realtime get result from the searcher.
          */
         public GetResult(Searcher searcher, Versions.DocIdAndVersion docIdAndVersion) {
-            this.exists = true;
-            this.source = null;
-            this.version = docIdAndVersion.version;
-            this.docIdAndVersion = docIdAndVersion;
-            this.searcher = searcher;
+            this(true, docIdAndVersion.version, docIdAndVersion, searcher);
         }
 
         public boolean exists() {
@@ -1034,11 +1034,6 @@ public abstract class Engine implements Closeable {
 
         public long version() {
             return this.version;
-        }
-
-        @Nullable
-        public Translog.Source source() {
-            return source;
         }
 
         public Searcher searcher() {
@@ -1055,9 +1050,7 @@ public abstract class Engine implements Closeable {
         }
 
         public void release() {
-            if (searcher != null) {
-                searcher.close();
-            }
+            Releasables.close(searcher);
         }
     }
 

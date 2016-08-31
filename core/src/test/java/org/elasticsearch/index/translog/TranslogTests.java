@@ -88,9 +88,6 @@ import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 
-/**
- *
- */
 @LuceneTestCase.SuppressFileSystems("ExtrasFS")
 public class TranslogTests extends ESTestCase {
 
@@ -809,6 +806,38 @@ public class TranslogTests extends ESTestCase {
             if (randomBoolean()) {
                 translog.sync();
                 assertFalse("translog has been synced already", translog.ensureSynced(location));
+            }
+        }
+    }
+
+    public void testSyncUpToStream() throws IOException {
+        int iters = randomIntBetween(5, 10);
+        for (int i = 0; i < iters; i++) {
+            int translogOperations = randomIntBetween(10, 100);
+            int count = 0;
+            ArrayList<Location> locations = new ArrayList<>();
+            for (int op = 0; op < translogOperations; op++) {
+                if (rarely()) {
+                    translog.commit(); // do this first so that there is at least one pending tlog entry
+                }
+                final Translog.Location location = translog.add(new Translog.Index("test", "" + op, Integer.toString(++count).getBytes(Charset.forName("UTF-8"))));
+                locations.add(location);
+            }
+            Collections.shuffle(locations, random());
+            if (randomBoolean()) {
+                assertTrue("at least one operation pending", translog.syncNeeded());
+                assertTrue("this operation has not been synced", translog.ensureSynced(locations.stream()));
+                assertFalse("the last call to ensureSycned synced all previous ops", translog.syncNeeded()); // we are the last location so everything should be synced
+            } else if (rarely()) {
+                translog.commit();
+                assertFalse("location is from a previous translog - already synced", translog.ensureSynced(locations.stream())); // not syncing now
+                assertFalse("no sync needed since no operations in current translog", translog.syncNeeded());
+            } else {
+                translog.sync();
+                assertFalse("translog has been synced already", translog.ensureSynced(locations.stream()));
+            }
+            for (Location location : locations) {
+                assertFalse("all of the locations should be synced: " + location, translog.ensureSynced(location));
             }
         }
     }
@@ -1924,5 +1953,9 @@ public class TranslogTests extends ESTestCase {
         translog.close();
         IOUtils.close(view);
         translog = new Translog(config, generation);
+    }
+
+    public static Translog.Location randomTranslogLocation() {
+        return new Translog.Location(randomLong(), randomLong(), randomInt());
     }
 }

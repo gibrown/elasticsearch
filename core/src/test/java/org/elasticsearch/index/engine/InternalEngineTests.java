@@ -96,9 +96,11 @@ import org.elasticsearch.index.translog.Translog;
 import org.elasticsearch.index.translog.TranslogConfig;
 import org.elasticsearch.indices.IndicesModule;
 import org.elasticsearch.indices.mapper.MapperRegistry;
+import org.elasticsearch.plugins.Plugin;
 import org.elasticsearch.test.DummyShardLock;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.test.IndexSettingsModule;
+import org.elasticsearch.test.InternalSettingsPlugin;
 import org.elasticsearch.threadpool.TestThreadPool;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.hamcrest.MatcherAssert;
@@ -114,6 +116,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
@@ -726,17 +729,17 @@ public class InternalEngineTests extends ESTestCase {
         MatcherAssert.assertThat(searchResult, EngineSearcherTotalHitsMatcher.engineSearcherTotalHits(new TermQuery(new Term("value", "test")), 0));
         searchResult.close();
 
-        // but, we can still get it (in realtime)
-        Engine.GetResult getResult = engine.get(new Engine.Get(true, newUid("1")));
-        assertThat(getResult.exists(), equalTo(true));
-        assertThat(getResult.source().source, equalTo(B_1));
-        assertThat(getResult.docIdAndVersion(), nullValue());
-        getResult.release();
-
         // but, not there non realtime
-        getResult = engine.get(new Engine.Get(false, newUid("1")));
+        Engine.GetResult getResult = engine.get(new Engine.Get(false, newUid("1")));
         assertThat(getResult.exists(), equalTo(false));
         getResult.release();
+
+        // but, we can still get it (in realtime)
+        getResult = engine.get(new Engine.Get(true, newUid("1")));
+        assertThat(getResult.exists(), equalTo(true));
+        assertThat(getResult.docIdAndVersion(), notNullValue());
+        getResult.release();
+
         // refresh and it should be there
         engine.refresh("test");
 
@@ -769,8 +772,7 @@ public class InternalEngineTests extends ESTestCase {
         // but, we can still get it (in realtime)
         getResult = engine.get(new Engine.Get(true, newUid("1")));
         assertThat(getResult.exists(), equalTo(true));
-        assertThat(getResult.source().source, equalTo(B_2));
-        assertThat(getResult.docIdAndVersion(), nullValue());
+        assertThat(getResult.docIdAndVersion(), notNullValue());
         getResult.release();
 
         // refresh and it should be updated
@@ -835,7 +837,6 @@ public class InternalEngineTests extends ESTestCase {
         // and, verify get (in real time)
         getResult = engine.get(new Engine.Get(true, newUid("1")));
         assertThat(getResult.exists(), equalTo(true));
-        assertThat(getResult.source(), nullValue());
         assertThat(getResult.docIdAndVersion(), notNullValue());
         getResult.release();
 
@@ -1019,12 +1020,6 @@ public class InternalEngineTests extends ESTestCase {
         engine.index(new Engine.Index(newUid("2"), doc));
         EngineConfig config = engine.config();
         engine.close();
-        final MockDirectoryWrapper directory = DirectoryUtils.getLeaf(store.directory(), MockDirectoryWrapper.class);
-        if (directory != null) {
-            // since we rollback the IW we are writing the same segment files again after starting IW but MDW prevents
-            // this so we have to disable the check explicitly
-            directory.setPreventDoubleWrite(false);
-        }
         engine = new InternalEngine(copy(config, EngineConfig.OpenMode.OPEN_INDEX_AND_TRANSLOG));
         engine.recoverFromTranslog();
         assertNull("Sync ID must be gone since we have a document to replay", engine.getLastCommittedSegmentInfos().getUserData().get(Engine.SYNC_COMMIT_ID));
@@ -1480,28 +1475,33 @@ public class InternalEngineTests extends ESTestCase {
     public void testBasicCreatedFlag() {
         ParsedDocument doc = testParsedDocument("1", "1", "test", null, -1, -1, testDocument(), B_1, null);
         Engine.Index index = new Engine.Index(newUid("1"), doc);
-        assertTrue(engine.index(index));
+        engine.index(index);
+        assertTrue(index.isCreated());
 
         index = new Engine.Index(newUid("1"), doc);
-        assertFalse(engine.index(index));
+        engine.index(index);
+        assertFalse(index.isCreated());
 
         engine.delete(new Engine.Delete(null, "1", newUid("1")));
 
         index = new Engine.Index(newUid("1"), doc);
-        assertTrue(engine.index(index));
+        engine.index(index);
+        assertTrue(index.isCreated());
     }
 
     public void testCreatedFlagAfterFlush() {
         ParsedDocument doc = testParsedDocument("1", "1", "test", null, -1, -1, testDocument(), B_1, null);
         Engine.Index index = new Engine.Index(newUid("1"), doc);
-        assertTrue(engine.index(index));
+        engine.index(index);
+        assertTrue(index.isCreated());
 
         engine.delete(new Engine.Delete(null, "1", newUid("1")));
 
         engine.flush();
 
         index = new Engine.Index(newUid("1"), doc);
-        assertTrue(engine.index(index));
+        engine.index(index);
+        assertTrue(index.isCreated());
     }
 
     private static class MockAppender extends AppenderSkeleton {
@@ -1760,7 +1760,6 @@ public class InternalEngineTests extends ESTestCase {
         if (directory != null) {
             // since we rollback the IW we are writing the same segment files again after starting IW but MDW prevents
             // this so we have to disable the check explicitly
-            directory.setPreventDoubleWrite(false);
             boolean started = false;
             final int numIters = randomIntBetween(10, 20);
             for (int i = 0; i < numIters; i++) {
@@ -1806,12 +1805,6 @@ public class InternalEngineTests extends ESTestCase {
             TopDocs topDocs = searcher.searcher().search(new MatchAllDocsQuery(), randomIntBetween(numDocs, numDocs + 10));
             assertThat(topDocs.totalHits, equalTo(numDocs));
         }
-        final MockDirectoryWrapper directory = DirectoryUtils.getLeaf(store.directory(), MockDirectoryWrapper.class);
-        if (directory != null) {
-            // since we rollback the IW we are writing the same segment files again after starting IW but MDW prevents
-            // this so we have to disable the check explicitly
-            directory.setPreventDoubleWrite(false);
-        }
         engine.close();
         engine = new InternalEngine(engine.config());
 
@@ -1823,7 +1816,8 @@ public class InternalEngineTests extends ESTestCase {
     }
 
     private Mapping dynamicUpdate() {
-        BuilderContext context = new BuilderContext(Settings.EMPTY, new ContentPath());
+        BuilderContext context = new BuilderContext(
+            Settings.builder().put(IndexMetaData.SETTING_VERSION_CREATED, Version.CURRENT).build(), new ContentPath());
         final RootObjectMapper root = new RootObjectMapper.Builder("some_type").build(context);
         return new Mapping(Version.CURRENT, root, new MetadataFieldMapper[0], emptyMap());
     }
@@ -1929,12 +1923,6 @@ public class InternalEngineTests extends ESTestCase {
         try (Engine.Searcher searcher = engine.acquireSearcher("test")) {
             TopDocs topDocs = searcher.searcher().search(new MatchAllDocsQuery(), randomIntBetween(numDocs, numDocs + 10));
             assertThat(topDocs.totalHits, equalTo(numDocs));
-        }
-        final MockDirectoryWrapper directory = DirectoryUtils.getLeaf(store.directory(), MockDirectoryWrapper.class);
-        if (directory != null) {
-            // since we rollback the IW we are writing the same segment files again after starting IW but MDW prevents
-            // this so we have to disable the check explicitly
-            directory.setPreventDoubleWrite(false);
         }
 
         TranslogHandler parser = (TranslogHandler) engine.config().getTranslogRecoveryPerformer();
@@ -2052,12 +2040,6 @@ public class InternalEngineTests extends ESTestCase {
         try (Engine.Searcher searcher = engine.acquireSearcher("test")) {
             TopDocs topDocs = searcher.searcher().search(new MatchAllDocsQuery(), randomIntBetween(numDocs, numDocs + 10));
             assertThat(topDocs.totalHits, equalTo(numDocs));
-        }
-        final MockDirectoryWrapper directory = DirectoryUtils.getLeaf(store.directory(), MockDirectoryWrapper.class);
-        if (directory != null) {
-            // since we rollback the IW we are writing the same segment files again after starting IW but MDW prevents
-            // this so we have to disable the check explicitly
-            directory.setPreventDoubleWrite(false);
         }
         Translog.TranslogGeneration generation = engine.getTranslog().getGeneration();
         engine.close();
